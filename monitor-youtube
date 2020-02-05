@@ -17,6 +17,11 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
+# Requirements:
+# To run this script you need Perl 5.28 or later, and LWP::UserAgent 6.36 or later.
+# Debian 10 (buster) or Ubuntu 18 LTS (bionic) is recommended. Install the
+# libwww-perl package for LWP::UserAgent.
+
 use warnings;
 use strict;
 use JSON;
