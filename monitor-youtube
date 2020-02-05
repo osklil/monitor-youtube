@@ -1,0 +1,197 @@
+#!/usr/bin/perl
+#
+# monitor-youtube - Monitor specific YouTube channels and output new activities
+# Copyright (C) 2020  Oskar Liljeblad
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+
+use warnings;
+use strict;
+use JSON;
+use File::Basename;
+use File::Spec;
+use Getopt::Long;
+use LWP::UserAgent;
+
+my $server_error_tries = 10;
+my $server_error_delay = 3;
+my $state_file = File::Spec->catfile($ENV{'HOME'}, '.monitor-youtube.state');
+my $conf_file = File::Spec->catfile($ENV{'HOME'}, '.monitor-youtube.conf');
+
+$::program = basename($0);
+
+my %opt;
+Getopt::Long::Configure('bundling');
+Getopt::Long::GetOptions(\%opt,
+  'help',
+  'verbose|v',
+) || exit 1;
+if ($opt{'help'}) {
+  print "Usage: $::program: [OPTION]...\n";
+  print "Monitor specified YouTube channels and output new activities to standard out.\n\n";
+  print "  -v, --verbose  explain what is being done\n";
+  print "      --help     display this help and exit\n";
+  print "\nYouTube API key (api_key) and channels (channel) are specified in the configuration\n";
+  print "which is .monitor-youtube.conf in your home directory. For example:\n\n";
+  print "  api_key = Axxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\n";
+  print "  channel = UCBR8-60-B28hp2BmDPdntcQ # YouTube\n";
+  print "\nLast seen events for each channel are stored in the file .monitor-youtube.state in\n";
+  print "your home directory. This file can be edited manually if needed.\n";
+  print "\nBy using this software, you agree to and are bound by the YouTube Terms of Service\n";
+  print "which is located at <https://www.youtube.com/t/terms>.\n";
+  print "\nThis program does not collect, store or disclose any information about its users.\n";
+  print "The Google Privacy Policy which is located at <http://www.google.com/policies/privacy>\n";
+  print "applies to YouTube API access.\n";
+  print "\nCreated by Oskar Liljeblad.\n";
+  exit;
+}
+
+binmode($_, ':utf8') for \*STDIN, \*STDOUT, \*STDERR;
+
+my ($api_key, @channels);
+open(my $fh, '<:utf8', $conf_file) || die "$::program: cannot open $conf_file: $!\n";
+while (defined (my $line = <$fh>)) {
+  chomp $line;
+  my ($key, $value) = $line =~ /^\s*([^\s=]+)\s*=\s*([^#\s]+)\s*(#.*)?$/;
+  die "$::program: $conf_file:$.: invalid line\n" if !defined $key || ($key ne 'api_key' && $key ne 'channel');
+  $api_key = $value if $key eq 'api_key';
+  push @channels, $value if $key eq 'channel';
+}
+close $fh;
+
+my %channel_last_publish_date;
+my %channel_title;
+if (-f $state_file) {
+  open(my $fh, '<:utf8', $state_file) || die "$::program: cannot open $state_file: $!\n";
+  while (<$fh>) {
+    chomp;
+    my ($channel, $last_publish_date, $channel_title) = /^([^ ]+) ([^ ]+) (.*)$/;
+    $channel_last_publish_date{$channel} = $last_publish_date;
+    $channel_title{$channel} = $channel_title if defined $channel_title;
+  }
+}
+
+my $ua = LWP::UserAgent->new(keep_alive => 0, local_address => '0.0.0.0', timeout => 60);
+my $json = JSON->new->utf8();
+
+if (grep { !defined $channel_title{$_} } @channels) {
+  my $page_token;
+  for (;;) {
+    my $uri = URI->new('https://www.googleapis.com/youtube/v3/channels');
+    my %param = ('part' => 'snippet', 'id' => join(',', @channels), 'maxResults' => 50, 'key' => $api_key);
+    $param{'pageToken'} = $page_token if defined $page_token;
+    $uri->query_form(%param);
+    my $rsp;
+    for (my $try = 1; ; $try++) {
+      warn "GET $uri\n" if $opt{'verbose'};
+      $rsp = $ua->get($uri);
+      if ($rsp->is_server_error() && $try < $server_error_tries) {
+        warn "$::program: retrying due to server error: ", $rsp->decoded_content(), "\n";
+        sleep $server_error_delay;
+        next;
+      }
+      die "$::program: cannot get YouTube channels information: ", $rsp->status_line(), "\n" if !$rsp->is_success();
+      last;
+    }
+    my $data = $json->decode($rsp->decoded_content());
+    foreach my $channel (@{$data->{'items'}}) {
+      $channel_title{$channel->{'id'}} = $channel->{'snippet'}->{'title'};
+    }
+    $page_token = $data->{'nextPageToken'} // last;
+  }
+}
+
+my %channel_new_last_publish_date = %channel_last_publish_date;
+foreach my $channel (@channels) {
+  my $page_token;
+  for (;;) {
+    my $uri = URI->new('https://www.googleapis.com/youtube/v3/activities');
+    my %param = ('part' => 'snippet,contentDetails', 'channelId' => $channel, 'maxResults' => 50, 'key' => $api_key);
+    $param{'pageToken'} = $page_token if defined $page_token;
+    $param{'publishedAfter'} = $channel_last_publish_date{$channel} if exists $channel_last_publish_date{$channel};
+    $uri->query_form(%param);
+    my $rsp;
+    for (my $try = 1; ; $try++) {
+      warn "GET $uri\n" if $opt{'verbose'};
+      $rsp = $ua->get($uri);
+      if ($rsp->is_server_error() && $try < $server_error_tries) {
+        warn "$::program: retrying due to server error: ", $rsp->decoded_content(), "\n";
+        sleep $server_error_delay;
+        next;
+      }
+      last;
+    }
+    if (!$rsp->is_success()) {
+      warn "$::program: cannot get YouTube channel $channel activities: ", $rsp->status_line(), "\n";
+      last;
+    }
+    my $data = $json->decode($rsp->decoded_content());
+    foreach my $item (@{$data->{'items'}}) {
+      my $pub_date = $item->{'snippet'}->{'publishedAt'};
+      next if defined $channel_last_publish_date{$channel} && $pub_date eq $channel_last_publish_date{$channel};
+      my $detail;
+      if ($item->{'snippet'}->{'type'} eq 'upload') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'upload'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'bulletin' && $item->{'contentDetails'}->{'bulletin'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'bulletin'}->{'resourceId'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'like' && $item->{'contentDetails'}->{'like'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'like'}->{'resourceId'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'favorite' && $item->{'contentDetails'}->{'favorite'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'favorite'}->{'resourceId'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'comment' && $item->{'contentDetails'}->{'comment'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'comment'}->{'resourceId'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'recommendation' && $item->{'contentDetails'}->{'recommendation'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'recommendation'}->{'resourceId'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'social' && $item->{'contentDetails'}->{'social'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtu.be/'.$item->{'contentDetails'}->{'social'}->{'resourceId'}->{'videoId'};
+      } elsif ($item->{'snippet'}->{'type'} eq 'playlistItem' && $item->{'contentDetails'}->{'playlistItem'}->{'resourceId'}->{'kind'} eq 'youtube#video') {
+        $detail = 'https://youtube.com/playlist?list='.$item->{'contentDetails'}->{'playlistItem'}->{'playlistId'};
+      } else {
+        $detail = $json->encode($item->{'contentDetails'}->{$item->{'snippet'}->{'type'}});
+      }
+      print $channel_title{$channel} // $channel, ' ', format_date($pub_date), ' ', $item->{'snippet'}->{'type'}, ' ', $detail, ' ', format_title($item->{'snippet'}->{'title'}), "\n";
+      $channel_new_last_publish_date{$channel} = $pub_date if !defined $channel_new_last_publish_date{$channel} || $pub_date gt $channel_new_last_publish_date{$channel};
+    }
+    $page_token = $data->{'nextPageToken'} // last;
+  }
+}
+
+open($fh, '>:utf8', $state_file) || die "$::program: cannot open $state_file for writing: $!\n";
+foreach my $channel (@channels) {
+  if (defined $channel_new_last_publish_date{$channel}) {
+    if (defined $channel_title{$channel}) {
+      print $fh $channel, ' ', $channel_new_last_publish_date{$channel}, ' ', $channel_title{$channel}, "\n";
+    } else {
+      print $fh $channel, ' ', $channel_new_last_publish_date{$channel}, "\n";
+    }
+  }
+}
+close $fh or die "$::program: cannot close $state_file: $!\n";
+
+sub format_date {
+  my ($date) = @_;
+  $date =~ s/\.\d*//;
+  return $date;
+}
+
+sub format_title {
+  my ($title) = @_;
+  return '' if !defined $title;
+  my $o = '';
+  for (my $c = 0; $c < length $title; $c++) {
+    $o .= ord(substr($title, $c, 1)) >= 127 ? '.' : substr($title, $c, 1);
+  }
+  return $o;
+}
