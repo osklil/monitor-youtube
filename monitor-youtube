@@ -30,7 +30,7 @@ use File::Spec;
 use Getopt::Long;
 use LWP::UserAgent;
 
-my $server_error_tries = 10;
+my $server_error_tries = 3;
 my $server_error_delay = 3;
 my $state_file = File::Spec->catfile($ENV{'HOME'}, '.monitor-youtube.state');
 my $conf_file = File::Spec->catfile($ENV{'HOME'}, '.monitor-youtube.conf');
@@ -103,11 +103,14 @@ if (grep { !defined $channel_title{$_} } @channels) {
       warn "GET $uri\n" if $opt{'verbose'};
       $rsp = $ua->get($uri);
       if ($rsp->is_server_error() && $try < $server_error_tries) {
-        warn "$::program: retrying due to server error: ", $rsp->decoded_content(), "\n";
+        report_remote_error($rsp, 'retrying due to server error');
         sleep $server_error_delay;
         next;
       }
-      die "$::program: cannot get YouTube channels information: ", $rsp->status_line(), "\n" if !$rsp->is_success();
+      if (!$rsp->is_success()) {
+        report_remote_error($rsp, 'cannot get YouTube channels information');
+        exit 1;
+      }
       last;
     }
     my $data = $json->decode($rsp->decoded_content());
@@ -132,14 +135,14 @@ foreach my $channel (@channels) {
       warn "GET $uri\n" if $opt{'verbose'};
       $rsp = $ua->get($uri);
       if ($rsp->is_server_error() && $try < $server_error_tries) {
-        warn "$::program: retrying due to server error: ", $rsp->decoded_content(), "\n";
+        report_remote_error($rsp, 'retrying due to server error');
         sleep $server_error_delay;
         next;
       }
       last;
     }
     if (!$rsp->is_success()) {
-      warn "$::program: cannot get YouTube channel $channel activities: ", $rsp->status_line(), "\n";
+      report_remote_error($rsp, "cannot get YouTube channel $channel activities");
       last;
     }
     my $data = $json->decode($rsp->decoded_content());
@@ -199,4 +202,18 @@ sub format_title {
     $o .= ord(substr($title, $c, 1)) >= 127 ? '.' : substr($title, $c, 1);
   }
   return $o;
+}
+
+sub report_remote_error {
+  my ($rsp, $message) = @_;
+  warn "$::program: $message: ", $rsp->status_line(), "\n";
+  my $error_text = $rsp->decoded_content();
+  my $error_data = eval { $json->decode($error_text) };
+  if ($@) {
+    warn "$::program: cannot parse JSON in response: $@"
+  } elsif (ref $error_data ne 'HASH' || !exists $error_data->{'error'} || ref $error_data->{'error'} ne 'HASH' || !exists $error_data->{'error'}->{'message'} || ref $error_data->{'error'}->{'message'}) {
+    warn "$::program: unexpected JSON object in response: $@"
+  } else {
+    warn "$::program: error: ", $error_data->{'error'}->{'message'}, "\n";
+  }
 }
